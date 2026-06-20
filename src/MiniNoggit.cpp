@@ -322,10 +322,9 @@ namespace wxl::scripts::mininoggit
         w[2] = l[0] * m[2] + l[1] * m[6] + l[2] * m[10] + m[14];
     }
 
-    // Wireframe box around the selected doodad, built from the LIVE instance matrix so it tracks the model's
-    // real position / rotation / scale. The doodad's own bbox is a degenerate point and unusable; the exact
-    // model-local extents come from a pending RE pass, so for now this is a placeholder local box sized to
-    // sit on the model origin (a marker that the right model is selected, not a tight fit yet).
+    // Wireframe box around the selected doodad, built from the model's real local AABB (the MD20 header
+    // bounds) transformed by the LIVE instance matrix, so it tracks the model's position / rotation / scale
+    // and fits the actual mesh. Falls back to a small origin marker when the header bounds are not readable.
     void MiniNoggit::DrawSelectionBox()
     {
         namespace doodad = wxl::game::doodad;
@@ -335,9 +334,13 @@ namespace wxl::scripts::mininoggit
         float m[16];
         if (!doodad::WorldMatrix(selected_, m)) return; // model not loaded yet
 
-        // Placeholder model-local box: sits on the origin (z from 0 up), pending real header bounds.
-        const float lo[3] = { -2.0f, -2.0f, 0.0f };
-        const float hi[3] = {  2.0f,  2.0f, 6.0f };
+        // Real model-local extents from the MD20 header, or a small origin marker if not yet available.
+        float lo[3], hi[3];
+        if (!doodad::LocalBounds(selected_, lo, hi))
+        {
+            lo[0] = -2.0f; lo[1] = -2.0f; lo[2] = 0.0f;
+            hi[0] =  2.0f; hi[1] =  2.0f; hi[2] = 6.0f;
+        }
 
         const float* vp = camera::ViewProj();
         const ImGuiIO& io = ImGui::GetIO();
@@ -389,9 +392,10 @@ namespace wxl::scripts::mininoggit
         if (ImGuizmo::IsUsing()) doodad::SetWorldMatrix(selected_, model);
     }
 
-    // Resolve a screen click into a doodad: project each near-camera doodad's world bounding box to the
-    // screen and select the nearest one whose projected rectangle contains the cursor. Handles tall
-    // models (the box covers the whole visible doodad) and needs no matrix inverse and no engine call.
+    // Resolve a screen click into a doodad: for each near-camera doodad, transform its real model-local AABB
+    // by the live instance matrix, project the 8 world corners to the screen, and select the nearest one whose
+    // projected rectangle contains the cursor. Rotation/scale are handled (all 8 corners are projected) and it
+    // needs no matrix inverse and no engine call.
     void MiniNoggit::DoPick(int sx, int sy)
     {
         namespace doodad = wxl::game::doodad;
@@ -409,22 +413,23 @@ namespace wxl::scripts::mininoggit
 
         void* best = nullptr;
         float bestDepth = 1e18f, bestSpanX = 0.0f, bestSpanY = 0.0f;
-        float dbgExtent = 0.0f; // largest world box diagonal seen, to confirm the boxes are real
+        int boxed = 0; // doodads with a usable model AABB, to confirm the bounds are real
         for (int i = 0; i < n; ++i)
         {
-            float mn[3], mx[3];
-            if (!doodad::BBox(list[i], mn, mx)) continue;
-            const float ex = mx[0] - mn[0], ey = mx[1] - mn[1], ez = mx[2] - mn[2];
-            const float diag = ex * ex + ey * ey + ez * ez;
-            if (diag > dbgExtent) dbgExtent = diag;
+            float m[16], lo[3], hi[3];
+            if (!doodad::WorldMatrix(list[i], m)) continue;   // model still loading
+            if (!doodad::LocalBounds(list[i], lo, hi)) continue; // no readable header bounds
+            ++boxed;
 
             float rminx = 1e9f, rminy = 1e9f, rmaxx = -1e9f, rmaxy = -1e9f, depth = 1e18f;
             int frontCorners = 0;
             for (int k = 0; k < 8; ++k)
             {
-                const float c[3] = { (k & 1) ? mx[0] : mn[0],
-                                     (k & 2) ? mx[1] : mn[1],
-                                     (k & 4) ? mx[2] : mn[2] };
+                const float l[3] = { (k & 1) ? hi[0] : lo[0],
+                                     (k & 2) ? hi[1] : lo[1],
+                                     (k & 4) ? hi[2] : lo[2] };
+                float c[3];
+                LocalToWorld(m, l, c);
                 float clip[4];
                 for (int j = 0; j < 4; ++j)
                     clip[j] = c[0] * vp[j] + c[1] * vp[4 + j] + c[2] * vp[8 + j] + vp[12 + j];
@@ -445,8 +450,8 @@ namespace wxl::scripts::mininoggit
                 bestSpanX = rmaxx - rminx; bestSpanY = rmaxy - rminy;
             }
         }
-        WLOG_INFO("pick: cursor=%d,%d doodads=%d maxBoxDiag=%.1f selected=%s span=%.0fx%.0f",
-                  sx, sy, n, dbgExtent, best ? "yes" : "no", bestSpanX, bestSpanY);
+        WLOG_INFO("pick: cursor=%d,%d doodads=%d boxed=%d selected=%s span=%.0fx%.0f",
+                  sx, sy, n, boxed, best ? "yes" : "no", bestSpanX, bestSpanY);
         if (best) selected_ = best;
     }
 
